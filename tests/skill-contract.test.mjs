@@ -2,7 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, stat, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, stat, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,11 +12,12 @@ const client = fileURLToPath(new URL('../skills/eurekamind/scripts/client.mjs', 
 const key = 'em_ro_' + randomBytes(32).toString('base64url');
 const observed = [];
 const sample = ['recording', 'transcript', 'note', 'memo_audio', 'memo_text', 'memo_asset'].map((type, i) => ({ id: `fixture-${i}`, type, title: `Sample ${type}` }));
-let server, origin, temp, config;
-function run(args, input) {
+let server, origin, temp, config, gatewayStatus = 200, identityScope = 'assets:read';
+function run(args, input, overrides = {}, configFile = config, preload) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env }; delete env.EUREKAMIND_API_KEY; delete env.EUREKAMIND_API_BASE;
-    const child = spawn(process.execPath, [client, ...args, '--config', config], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    Object.assign(env, overrides);
+    const child = spawn(process.execPath, [...(preload ? ['--import', preload] : []), client, ...args, '--config', configFile], { env, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', bytes => stdout += bytes); child.stderr.on('data', bytes => stderr += bytes);
     child.on('error', reject); child.on('close', code => resolve({ code, stdout, stderr }));
@@ -34,14 +35,15 @@ before(async () => {
     const request = JSON.parse(body); observed.push(request);
     if (req.url !== '/api/agent/v1/gateway' || req.method !== 'POST') { res.writeHead(404); res.end(); return; }
     res.setHeader('Content-Type', 'application/json');
+    if (gatewayStatus !== 200) { res.writeHead(gatewayStatus); res.end('{}'); return; }
     if (req.headers.authorization !== 'Bearer ' + key) {
       res.writeHead(401); res.end(JSON.stringify({ code: 'UNAUTHORIZED', message: 'Never display upstream secrets: ' + key })); return;
     }
-    if (request.protocol_version !== '1' || request.skill_version !== '0.1.0' || !request.params) {
+    if (request.protocol_version !== '1' || request.skill_version !== '0.2.0' || !request.params) {
       res.writeHead(400); res.end(JSON.stringify({ code: 'INVALID_REQUEST' })); return;
     }
     let data;
-    if (request.api_name === '/me') data = { userId: 'fixture-user', scope: 'assets:read', dataSource: 'local-demo' };
+    if (request.api_name === '/me') data = { userId: 'fixture-user', scope: identityScope, dataSource: 'local-demo' };
     else if (request.api_name === '/assets/search') {
       const offset = request.params.cursor === 'page-2' ? 3 : 0;
       data = { items: sample.slice(offset, offset + 3), hasMore: offset === 0, nextCursor: offset === 0 ? 'page-2' : '', dataSource: 'local-demo' };
@@ -51,7 +53,7 @@ before(async () => {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   origin = `http://127.0.0.1:${server.address().port}`;
-  const result = await run(['configure', '--base-url', origin], key + '\n'); assert.equal(result.code, 0);
+  const result = await run(['configure', '--base-url', origin, '--demo'], key + '\n'); assert.equal(result.code, 0);
 });
 after(async () => { if (server) await new Promise(resolve => server.close(resolve)); if (temp) await rm(temp, { recursive: true, force: true }); });
 
@@ -68,7 +70,7 @@ test('all pages preserve query, send versions and contain all six asset types', 
   const data = JSON.parse(result.stdout); assert.equal(data.complete, true); assert.equal(data.items.length, 6);
   assert.deepEqual(data.items.map(item => item.type), sample.map(item => item.type));
   const requests = observed.filter(item => item.api_name === '/assets/search'); assert.equal(requests.length, 2);
-  assert.ok(requests.every(item => item.params.query === 'sample' && item.skill_version === '0.1.0' && item.protocol_version === '1'));
+  assert.ok(requests.every(item => item.params.query === 'sample' && item.skill_version === '0.2.0' && item.protocol_version === '1'));
   assert.equal(requests[1].params.cursor, 'page-2');
 });
 test('downloads omit credentials and cannot overwrite an existing file', async () => {
@@ -82,8 +84,64 @@ test('downloads omit credentials and cannot overwrite an existing file', async (
 test('rejected configuration leaves credentials intact and hides upstream secrets', async () => {
   const before = await readFile(config, 'utf8');
   const invalid = 'em_ro_' + randomBytes(32).toString('base64url');
-  const result = await run(['configure', '--base-url', origin], invalid + '\n');
+  const result = await run(['configure', '--base-url', origin, '--demo'], invalid + '\n');
   assert.notEqual(result.code, 0); assert.match(result.stderr, /UNAUTHORIZED/);
   assert.ok(!result.stderr.includes(key) && !result.stderr.includes(invalid));
+  assert.ok((await readFile(config, 'utf8')) === before);
+});
+
+test('missing endpoints and implicit loopback configuration fail before network access', async () => {
+  const before = await readFile(config, 'utf8');
+  const count = observed.length;
+  let result = await run(['me'], '', {}, path.join(temp, 'absent.json'));
+  assert.notEqual(result.code, 0); assert.match(result.stderr, /No service address/);
+  result = await run(['configure'], key + '\n');
+  assert.notEqual(result.code, 0); assert.match(result.stderr, /no default endpoint/i);
+  result = await run(['configure', '--base-url', origin], key + '\n');
+  assert.notEqual(result.code, 0); assert.match(result.stderr, /explicit --demo/);
+  assert.equal(observed.length, count);
+  assert.ok((await readFile(config, 'utf8')) === before);
+});
+
+test('legacy local credentials require explicit sample opt-in', async () => {
+  const legacy = path.join(temp, 'legacy.json');
+  await writeFile(legacy, JSON.stringify({ baseUrl: origin, key }), { mode: 0o600 });
+  let result = await run(['me'], '', {}, legacy);
+  assert.notEqual(result.code, 0); assert.match(result.stderr, /explicit --demo/);
+  result = await run(['me', '--demo'], '', {}, legacy);
+  assert.equal(result.code, 0); assert.equal(JSON.parse(result.stdout).dataSource, 'local-demo');
+});
+
+test('environment credentials cannot inherit a saved address or demo opt-in', async () => {
+  let result = await run(['me'], '', { EUREKAMIND_API_KEY: key });
+  assert.notEqual(result.code, 0); assert.match(result.stderr, /never inherits/);
+  const env = { EUREKAMIND_API_KEY: key, EUREKAMIND_API_BASE: origin };
+  result = await run(['me'], '', env);
+  assert.notEqual(result.code, 0); assert.match(result.stderr, /explicit --demo/);
+  result = await run(['me', '--demo'], '', env); assert.equal(result.code, 0);
+});
+
+test('unavailable gateways and invalid identity cannot replace working credentials', async () => {
+  const before = await readFile(config, 'utf8');
+  try {
+    for (const status of [404, 503]) {
+      gatewayStatus = status;
+      const result = await run(['configure', '--base-url', origin, '--demo'], key + '\n');
+      assert.notEqual(result.code, 0); assert.match(result.stderr, /no sample fallback/);
+      assert.ok((await readFile(config, 'utf8')) === before);
+    }
+    gatewayStatus = 200; identityScope = 'assets:write';
+    const result = await run(['configure', '--base-url', origin, '--demo'], key + '\n');
+    assert.notEqual(result.code, 0); assert.match(result.stderr, /assets:read scope/);
+    assert.ok((await readFile(config, 'utf8')) === before);
+  } finally { gatewayStatus = 200; identityScope = 'assets:read'; }
+});
+
+test('service mode rejects sample responses even from an HTTPS origin', async () => {
+  const preload = path.join(temp, 'mock-fetch.mjs');
+  await writeFile(preload, "globalThis.fetch = async () => new Response(JSON.stringify({code:0,data:{scope:'assets:read',dataSource:'local-demo'}}), {status:200});");
+  const before = await readFile(config, 'utf8');
+  const result = await run(['configure', '--base-url', 'https://gateway.example.test'], key + '\n', {}, config, preload);
+  assert.notEqual(result.code, 0); assert.match(result.stderr, /endpoint returned sample data/);
   assert.ok((await readFile(config, 'utf8')) === before);
 });
