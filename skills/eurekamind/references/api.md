@@ -1,6 +1,8 @@
 # EurekaMind read API version 1
 
-Current implementation: local sample server on `http://127.0.0.1:9052`. This is not a production endpoint. The public GitHub repository and production hostname are not configured yet.
+Client release: **0.2.0**. Configure a verified HTTPS origin explicitly; there is no default endpoint. The known pre-release host `https://pre.card.biz` has not passed real Agent Gateway acceptance for this release. Public distribution is available from `hunterleememo-spec/EurekaMind-skill`; publishing it does not deploy the backend.
+
+The local protocol implementation remains a developer fixture, requiring explicit `--demo`. Limits and behaviors below that mention the sample server describe that implementation, not verified production guarantees. Read the deployed service's `/_list` before using it.
 
 ## Transport
 
@@ -9,7 +11,7 @@ Send JSON to `POST /api/agent/v1/gateway` with `Authorization: Bearer <read-only
 ```json
 {
   "protocol_version": "1",
-  "skill_version": "0.1.0",
+  "skill_version": "0.2.0",
   "api_name": "/assets/list",
   "params": {"type": "note", "limit": 20}
 }
@@ -60,9 +62,15 @@ Statuses in local fixtures: `ready`, `processing`. Processing content can be nul
 | 413 | BODY_TOO_LARGE | Keep requests under 16 KiB |
 | 429 | RATE_LIMITED | Wait one minute before retrying |
 
-## Browser management endpoints
+## Real account connection page
 
-Management uses an HttpOnly SameSite=Strict session cookie, not an API Key. Every management request needs `X-EurekaMind-Request: 1`; mutations use JSON. Cross-origin access is disabled.
+The standalone `/skills` page uses the existing account login and returns to `/skills#setup`. Planned Cookie-authenticated management routes are `POST /api/h5/agent/keys/current` and `POST /api/h5/agent/keys/current/reset`; these are a backend handoff contract, not implemented by the Skill. A frontend URL is not proof of a deployed Gateway. External agents use their independent Bearer Key, never the website session Cookie.
+
+Reminders need a confirmed deployed type/operation mapping. Do not invent a `/reminders/*` endpoint or assume `reminder` is supported by the sample types below.
+
+## Developer sample management endpoints
+
+The sample server must be deliberately selected with `--demo`. Its management uses an HttpOnly SameSite=Strict session cookie, not an API Key. Every management request needs `X-EurekaMind-Request: 1`; mutations use JSON. Cross-origin access is disabled.
 
 - `POST /api/agent/v1/session/demo {}` opens the explicitly labeled sample account. This is not real account authentication.
 - `GET /api/agent/v1/session` reads sample session state.
