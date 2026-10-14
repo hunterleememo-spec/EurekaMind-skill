@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 — 2026-10-14
+
+- Require an explicit verified service origin; remove localhost from the normal setup flow.
+- Require deliberate `--demo` opt-in for local sample access; block legacy implicit loopback configurations.
+- Reject sample responses outside demo mode and require environment Key/origin pairs.
+- Validate read-only identity before saving credentials; preserve existing configuration on failure.
+- Document the standalone `/skills` login return, unverified pre-release Gateway status, and pending Reminders mapping.
+- Add regression coverage for missing configuration, demo opt-in, migration and unavailable services.
+
 ## 0.1.0 — 2026-10-14
 
 Initial distributable integration preview.
