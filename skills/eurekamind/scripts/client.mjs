@@ -6,7 +6,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const args = process.argv.slice(2);
 const command = args.shift();
 const options = {};
@@ -14,7 +14,7 @@ for (let i = 0; i < args.length; i++) {
   if (!args[i].startsWith('--')) throw new Error('Expected a named option.');
   const key = args[i].slice(2);
   if (Object.hasOwn(options, key)) throw new Error('Duplicate option.');
-  options[key] = key === 'all' ? true : args[++i];
+  options[key] = ['all', 'demo'].includes(key) ? true : args[++i];
   if (options[key] === undefined) throw new Error('Missing option value.');
 }
 const configPath = path.resolve(options.config || path.join(homedir(), '.config/eurekamind/credentials.json'));
@@ -27,17 +27,25 @@ function baseUrl(value) {
   return url.origin;
 }
 function permitted(names) {
-  for (const name of Object.keys(options)) if (!names.includes(name) && name !== 'config') throw new Error('Unsupported option: --' + name);
+  for (const name of Object.keys(options)) if (!names.includes(name) && !['config', 'demo'].includes(name)) throw new Error('Unsupported option: --' + name);
+}
+function isLoopback(base) { return ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(base).hostname); }
+function connectionMode(base, allowDemo) {
+  if (isLoopback(base) && !allowDemo) throw new Error('Local sample access requires explicit --demo. For real data, configure the verified HTTPS service origin.');
+  return { base, allowDemo };
 }
 async function credentials() {
   let saved = {};
   try { saved = JSON.parse(await readFile(configPath, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw new Error('Could not read credential configuration.'); }
   const key = process.env.EUREKAMIND_API_KEY || saved.key;
   const endpoint = process.env.EUREKAMIND_API_BASE || saved.baseUrl;
-  if (!key || !endpoint) throw new Error('Configure the Key locally using the configure command. Do not paste it into a chat.');
+  if (!endpoint) throw new Error('No service address configured. Obtain the verified HTTPS Gateway origin and run configure --base-url URL. There is no default endpoint.');
+  if (process.env.EUREKAMIND_API_KEY && !process.env.EUREKAMIND_API_BASE) throw new Error('Set EUREKAMIND_API_BASE together with EUREKAMIND_API_KEY; an environment Key never inherits a saved endpoint.');
+  if (!key) throw new Error('Configure the Key locally using the configure command. Do not paste it into a chat.');
   const base = baseUrl(endpoint);
   if (!process.env.EUREKAMIND_API_KEY && base !== baseUrl(saved.baseUrl)) throw new Error('Endpoint changed. Configure a Key for the new endpoint explicitly.');
-  return { key, base };
+  const savedDemo = !process.env.EUREKAMIND_API_KEY && saved.mode === 'local-demo';
+  return { key, ...connectionMode(base, options.demo === true || savedDemo) };
 }
 async function request(connection, operation, params = {}) {
   let response;
@@ -48,12 +56,14 @@ async function request(connection, operation, params = {}) {
       body: JSON.stringify({ api_name: operation, protocol_version: '1', skill_version: VERSION, params }),
     });
   } catch { throw new Error('Gateway unreachable or timed out. Check the configured endpoint.'); }
+  if (response.status === 404 || response.status === 503) throw new Error(`Gateway unavailable (${response.status}). Confirm backend deployment and the configured service address; no sample fallback is used.`);
   let body;
   try { body = await response.json(); } catch { throw new Error('Gateway returned a non-JSON response.'); }
   if (!response.ok || body.code !== 0) {
     const code = /^[A-Z_]{1,40}$/.test(body.code) ? body.code : 'REQUEST_FAILED';
     throw new Error(`Gateway rejected request (${response.status}, ${code}).`);
   }
+  if (body.data?.dataSource === 'local-demo' && !connection.allowDemo) throw new Error('The endpoint returned sample data. Use --demo only for an intentional developer test; do not treat it as account data.');
   return body.data;
 }
 async function secretInput() {
@@ -81,18 +91,20 @@ async function secretInput() {
 }
 async function configure() {
   permitted(['base-url']);
-  if (!options['base-url']) throw new Error('Provide --base-url.');
+  if (!options['base-url']) throw new Error('Provide --base-url with the verified HTTPS Gateway origin. There is no default endpoint.');
   const base = baseUrl(options['base-url']);
+  const mode = connectionMode(base, options.demo === true);
   const key = await secretInput();
   if (!/^em_ro_[A-Za-z0-9_-]{43}$/.test(key)) throw new Error('Invalid Key format.');
-  const identity = await request({ base, key }, '/me');
+  const identity = await request({ ...mode, key }, '/me');
+  if (identity?.scope !== 'assets:read' || typeof identity.dataSource !== 'string' || !identity.dataSource) throw new Error('Gateway identity must declare assets:read scope and a dataSource. Configuration was not saved.');
   await mkdir(path.dirname(configPath), { recursive: true, mode: 0o700 });
   const temp = configPath + '.' + randomUUID() + '.tmp';
   try {
-    await writeFile(temp, JSON.stringify({ baseUrl: base, key }) + '\n', { mode: 0o600, flag: 'wx' });
+    await writeFile(temp, JSON.stringify({ baseUrl: base, key, mode: mode.allowDemo ? 'local-demo' : 'service' }) + '\n', { mode: 0o600, flag: 'wx' });
     await rename(temp, configPath); await chmod(configPath, 0o600);
   } finally { await unlink(temp).catch(() => {}); }
-  return { configured: true, dataSource: identity.dataSource, scope: identity.scope };
+  return { configured: true, mode: mode.allowDemo ? 'local-demo' : 'service', dataSource: identity.dataSource, scope: identity.scope };
 }
 async function pages(connection, operation, params) {
   if (!options.all) return request(connection, operation, params);
@@ -139,7 +151,7 @@ async function download(connection) {
   } finally { stream.destroy(); await unlink(temp).catch(() => {}); }
 }
 async function main() {
-  if (!command || command === 'help') return { commands: ['configure --base-url URL', 'me', 'capabilities', 'list [--type TYPE] [--all]', 'search --query TEXT [--all]', 'get --id ID', 'transcript --id ID [--all]', 'download --file-id ID --output PATH'], credentialInput: 'configure reads the Key from hidden terminal input or stdin', optional: '--config PATH selects a credential file' };
+  if (!command || command === 'help') return { version: VERSION, commands: ['configure --base-url HTTPS_ORIGIN', 'me', 'capabilities', 'list [--type TYPE] [--all]', 'search --query TEXT [--all]', 'get --id ID', 'transcript --id ID [--all]', 'download --file-id ID --output PATH'], endpoint: 'No default. Obtain the verified service origin; installation does not deploy a Gateway.', credentialInput: 'configure reads the Key from hidden terminal input or stdin', optional: '--config PATH selects a credential file; --demo explicitly enables developer sample access (saved by configure)' };
   if (command === 'configure') return configure();
   const connection = await credentials();
   if (command === 'me' || command === 'capabilities') { permitted([]); return request(connection, command === 'me' ? '/me' : '/_list'); }
