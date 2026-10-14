@@ -1,0 +1,22 @@
+name: Skill checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [18, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Validate distribution
+        run: node scripts/check-distribution.mjs
+      - name: Test read-only client contract
+        run: node --test tests/skill-contract.test.mjs
