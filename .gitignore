@@ -1,0 +1,9 @@
+.DS_Store
+node_modules/
+.local/
+.env
+.env.*
+credentials.json
+*.key
+*.pem
+*.part
